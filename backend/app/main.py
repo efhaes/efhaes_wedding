@@ -17,6 +17,10 @@ from app.modules.rsvp.router import router as rsvp_router
 from app.modules.users.router import router as users_router
 from app.modules.templates.router import router as templates_router
 from app.modules.workspaces.router import router as workspaces_router
+from app.modules.entitlements.routers.catalog_admin_router import (
+    router as catalog_admin_router,
+)
+from app.modules.billing.routers.billing_router import router as billing_router
 
 
 app = FastAPI(title="Efhaess Wedding API")
@@ -26,6 +30,8 @@ app.include_router(auth_router, prefix="/api/v1")
 app.include_router(users_router, prefix="/api/v1")
 app.include_router(workspaces_router, prefix="/api/v1")
 app.include_router(templates_router, prefix="/api/v1")
+app.include_router(catalog_admin_router, prefix="/api/v1")
+app.include_router(billing_router, prefix="/api/v1")
 app.include_router(invitations_router, prefix="/api/v1")
 app.include_router(invitation_editor_router, prefix="/api/v1")
 app.include_router(media_router, prefix="/api/v1")
@@ -95,6 +101,12 @@ def custom_openapi() -> dict:
 
     for path, path_item in schema.get("paths", {}).items():
         is_template_admin = path.startswith("/api/v1/templates/admin")
+        is_catalog_admin = path.startswith(
+            ("/api/v1/admin/plans", "/api/v1/admin/features")
+        )
+        is_billing = path.startswith(
+            ("/api/v1/purchases", "/api/v1/subscriptions", "/api/v1/payments")
+        )
         is_invitation_management = path.startswith(
             ("/api/v1/invitations/personal/", "/api/v1/invitations/workspaces/")
         )
@@ -104,7 +116,7 @@ def custom_openapi() -> dict:
             is_template_or_public_invitation = path.startswith(
                 ("/api/v1/templates/", "/api/v1/public/invitations/")
             )
-            if is_template_or_public_invitation:
+            if is_template_or_public_invitation or is_catalog_admin or is_billing:
                 for response_code in (
                     "401",
                     "403",
@@ -122,7 +134,12 @@ def custom_openapi() -> dict:
                                 "schema": {"$ref": "#/components/schemas/APIError"}
                             }
                         }
-            if is_template_admin or is_invitation_management:
+            if (
+                is_template_admin
+                or is_catalog_admin
+                or is_invitation_management
+                or is_billing
+            ):
                 schemes = {"AccessTokenCookie": []}
                 if method in {"post", "put", "patch", "delete"}:
                     schemes["CSRFToken"] = []

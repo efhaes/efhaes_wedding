@@ -86,12 +86,99 @@ def test_public_invitation_openapi_documents_optional_bearer_and_no_token_query(
     )
 
 
+def test_catalog_admin_openapi_documents_platform_admin_and_csrf_contract():
+    schema = app.openapi()
+    paths = schema["paths"]
+    plans = paths["/api/v1/admin/plans"]
+    features = paths["/api/v1/admin/features"]
+    create_plan = plans["post"]
+    update_plan = paths["/api/v1/admin/plans/{plan_id}"]["patch"]
+    map_feature = paths["/api/v1/admin/plans/{plan_id}/features"]["post"]
+
+    assert create_plan["security"] == [
+        {"AccessTokenCookie": [], "CSRFToken": []}
+    ]
+    assert plans["get"]["security"] == [{"AccessTokenCookie": []}]
+    assert update_plan["security"] == [
+        {"AccessTokenCookie": [], "CSRFToken": []}
+    ]
+    assert create_plan["requestBody"]["content"]["application/json"]["schema"][
+        "$ref"
+    ] == "#/components/schemas/PlanCreate"
+    assert create_plan["responses"]["201"]
+    assert create_plan["responses"]["401"]
+    assert create_plan["responses"]["403"]
+    assert create_plan["responses"]["409"]
+    assert create_plan["responses"]["422"]
+    assert map_feature["responses"]["404"]
+    assert map_feature["responses"]["409"]
+    assert features["post"]["security"] == [
+        {"AccessTokenCookie": [], "CSRFToken": []}
+    ]
+    assert "price" in schema["components"]["schemas"]["PlanRead"]["properties"]
+    assert "updated_at" in schema["components"]["schemas"]["FeatureRead"]["properties"]
+    for path, path_item in paths.items():
+        if not path.startswith(("/api/v1/admin/plans", "/api/v1/admin/features")):
+            continue
+        for method, operation in path_item.items():
+            if method not in {"get", "post", "patch", "delete"}:
+                continue
+            expected = {"AccessTokenCookie": []}
+            if method in {"post", "patch", "delete"}:
+                expected["CSRFToken"] = []
+            assert operation["security"] == [expected]
+
+
+def test_billing_openapi_documents_authenticated_read_and_csrf_creation():
+    schema = app.openapi()
+    paths = schema["paths"]
+
+    purchase_create = paths["/api/v1/purchases"]["post"]
+    subscription_create = paths["/api/v1/subscriptions"]["post"]
+    payment_read = paths["/api/v1/payments/{payment_id}"]["get"]
+    assert purchase_create["security"] == [
+        {"AccessTokenCookie": [], "CSRFToken": []}
+    ]
+    assert subscription_create["security"] == [
+        {"AccessTokenCookie": [], "CSRFToken": []}
+    ]
+    assert paths["/api/v1/purchases/{purchase_id}"]["get"]["security"] == [
+        {"AccessTokenCookie": []}
+    ]
+    assert payment_read["security"] == [{"AccessTokenCookie": []}]
+    assert purchase_create["requestBody"]["content"]["application/json"]["schema"][
+        "$ref"
+    ] == "#/components/schemas/PersonalPurchaseCreate"
+    assert "201" in purchase_create["responses"]
+    assert "409" in subscription_create["responses"]
+    assert "PaymentRead" in schema["components"]["schemas"]
+    assert "entitlement_snapshot" not in schema["components"]["schemas"][
+        "PersonalPurchaseRead"
+    ]["properties"]
+    assert "provider_reference" not in schema["components"]["schemas"][
+        "PaymentRead"
+    ]["properties"]
+    assert set(paths["/api/v1/payments/{payment_id}"]) == {"get"}
+
+
 def test_openapi_has_no_duplicate_method_path_routes():
     registered = set()
-    for route in app.routes:
-        if not isinstance(route, APIRoute):
-            continue
-        for method in route.methods - {"HEAD", "OPTIONS"}:
-            key = (method, route.path)
-            assert key not in registered, f"Duplicate route: {method} {route.path}"
-            registered.add(key)
+
+    def operations(router, prefix=""):
+        for route in router.routes:
+            if isinstance(route, APIRoute):
+                for method in route.methods - {"HEAD", "OPTIONS"}:
+                    yield method, f"{prefix}{route.path}"
+                continue
+            included_router = getattr(route, "original_router", None)
+            include_context = getattr(route, "include_context", None)
+            if included_router is not None and include_context is not None:
+                yield from operations(
+                    included_router,
+                    f"{prefix}{include_context.prefix}",
+                )
+
+    for method, path in operations(app):
+        key = (method, path)
+        assert key not in registered, f"Duplicate route: {method} {path}"
+        registered.add(key)

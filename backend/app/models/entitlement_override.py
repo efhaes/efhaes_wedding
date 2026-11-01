@@ -1,10 +1,11 @@
+from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import (
     CheckConstraint,
+    DateTime,
     ForeignKey,
     Index,
-    String,
     Uuid,
     Text,
 )
@@ -39,3 +40,4 @@ class EntitlementOverride(UUIDPrimaryKey, TimestampMixin, Base):
     is_enabled: Mapped[bool | None] = mapped_column()
     limit_override: Mapped[JSONValue | None] = mapped_column(JSONB)
     reason: Mapped[str | None] = mapped_column(Text)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

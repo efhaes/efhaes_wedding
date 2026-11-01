@@ -42,7 +42,7 @@ class Payment(UUIDPrimaryKey, TimestampMixin, Base):
     subscription_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("subscriptions.id", ondelete="RESTRICT")
     )
-    provider: Mapped[str] = mapped_column(String(80), nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(80))
     provider_reference: Mapped[str | None] = mapped_column(String(255), index=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)

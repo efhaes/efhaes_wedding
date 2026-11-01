@@ -22,7 +22,7 @@ from app.modules.entitlements.services.entitlement_resolver import (
     EntitlementResolver,
 )
 from app.modules.users.models.user import User
-from app.models.workspace import Workspace, WorkspaceMember
+from app.models.workspace import WorkspaceMember
 from app.modules.templates.models.template import Template
 from app.modules.templates.schemas.template import DefaultSection
 
@@ -38,11 +38,7 @@ class InvitationService:
         owner: User,
         payload: InvitationCreate,
     ) -> Invitation:
-        template = self._validate_template(payload.template_id)
-        self.entitlements.require_template_access(
-            template,
-            user_id=owner.id,
-        )
+        self._validate_template(payload.template_id)
         invitation = Invitation(
             owner_id=owner.id,
             workspace_id=None,
@@ -52,12 +48,12 @@ class InvitationService:
             slug=self._unique_slug(payload.slug, payload.title),
             status="draft",
         )
-        return self._persist_new(invitation)
+        return self._persist_new(invitation, personal_owner_id=owner.id)
 
     def create_workspace(
         self,
         workspace_id: UUID,
-        _membership: WorkspaceMember,
+        membership: WorkspaceMember,
         payload: InvitationCreate,
         client_id: UUID | None,
     ) -> Invitation:
@@ -67,10 +63,12 @@ class InvitationService:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Workspace not found",
             )
+        self._validate_workspace_editor_membership(workspace_id, membership)
         template = self._validate_template(payload.template_id)
         self.entitlements.require_template_access(
             template,
             workspace_id=workspace.id,
+            user_id=membership.user_id,
         )
         self._validate_client(client_id, workspace.id)
         invitation = Invitation(
@@ -82,7 +80,7 @@ class InvitationService:
             slug=self._unique_slug(payload.slug, payload.title),
             status="draft",
         )
-        return self._persist_new(invitation)
+        return self._persist_new(invitation, workspace_user_id=membership.user_id)
 
     def list_personal(
         self,
@@ -156,9 +154,16 @@ class InvitationService:
         workspace_id: UUID,
         invitation_id: UUID,
         payload: InvitationUpdate,
+        membership: WorkspaceMember,
     ) -> Invitation:
+        self._validate_workspace_editor_membership(workspace_id, membership)
         invitation = self.get_workspace(workspace_id, invitation_id)
-        return self._update(invitation, payload, workspace_id=workspace_id)
+        return self._update(
+            invitation,
+            payload,
+            workspace_id=workspace_id,
+            workspace_user_id=membership.user_id,
+        )
 
     def archive_personal(self, owner: User, invitation_id: UUID) -> Invitation:
         invitation = self.get_personal(owner, invitation_id)
@@ -174,6 +179,7 @@ class InvitationService:
         payload: InvitationUpdate,
         *,
         workspace_id: UUID | None,
+        workspace_user_id: UUID | None = None,
     ) -> Invitation:
         if invitation.status == "archived":
             raise HTTPException(
@@ -186,7 +192,11 @@ class InvitationService:
         if "template_id" in changes:
             self.entitlements.require_template_access(
                 template,
-                user_id=invitation.owner_id if workspace_id is None else None,
+                user_id=(
+                    invitation.owner_id
+                    if workspace_id is None
+                    else workspace_user_id
+                ),
                 workspace_id=workspace_id,
                 invitation_id=invitation.id if workspace_id is None else None,
             )
@@ -237,7 +247,13 @@ class InvitationService:
                 detail="Client does not belong to this workspace",
             )
 
-    def _persist_new(self, invitation: Invitation) -> Invitation:
+    def _persist_new(
+        self,
+        invitation: Invitation,
+        *,
+        workspace_user_id: UUID | None = None,
+        personal_owner_id: UUID | None = None,
+    ) -> Invitation:
         template = self.repository.find_published_template(invitation.template_id)
         if template is None:
             raise HTTPException(
@@ -247,7 +263,21 @@ class InvitationService:
         try:
             self.repository.add(invitation)
             self.session.flush()
-            self._require_entitlement(invitation, template)
+            if (
+                invitation.workspace_id is None
+                and personal_owner_id is not None
+                and template.access_level == "premium"
+            ):
+                self.entitlements.claim_unassigned_personal_purchase(
+                    user_id=personal_owner_id,
+                    invitation_id=invitation.id,
+                    feature_code="premium_templates",
+                )
+            self._require_entitlement(
+                invitation,
+                template,
+                workspace_user_id=workspace_user_id,
+            )
             existing_section = self.session.scalar(
                 select(InvitationSection.id)
                 .where(InvitationSection.invitation_id == invitation.id)
@@ -267,11 +297,14 @@ class InvitationService:
         self,
         invitation: Invitation,
         template: Template,
+        *,
+        workspace_user_id: UUID | None = None,
     ) -> None:
         if invitation.workspace_id is not None:
             self.entitlements.require_template_access(
                 template,
                 workspace_id=invitation.workspace_id,
+                user_id=workspace_user_id,
             )
         elif invitation.owner_id is not None:
             self.entitlements.require_template_access(
@@ -283,6 +316,21 @@ class InvitationService:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Invitation entitlement scope is invalid",
+            )
+
+    @staticmethod
+    def _validate_workspace_editor_membership(
+        workspace_id: UUID,
+        membership: WorkspaceMember,
+    ) -> None:
+        if (
+            membership.workspace_id != workspace_id
+            or membership.status != "active"
+            or membership.role not in {"owner", "admin", "editor"}
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Permission denied",
             )
 
     @staticmethod

@@ -184,6 +184,7 @@ def update_workspace_invitation(
         workspace_id,
         invitation_id,
         payload,
+        _membership,
     )
 
 

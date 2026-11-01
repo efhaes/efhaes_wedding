@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from sqlalchemy import ForeignKey, Index, UniqueConstraint, Uuid
+from sqlalchemy import Boolean, ForeignKey, Index, UniqueConstraint, Uuid
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -21,3 +21,6 @@ class PlanFeature(UUIDPrimaryKey, Base):
         Uuid(as_uuid=True), ForeignKey("features.id", ondelete="RESTRICT"), nullable=False
     )
     configuration: Mapped[JSONValue] = mapped_column(JSONB, nullable=False, default=dict)
+    is_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )

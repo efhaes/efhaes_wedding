@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,6 +16,7 @@ from app.models.client import Client
 from app.models.entitlement_override import EntitlementOverride
 from app.models.feature import Feature
 from app.models.invitation_section import InvitationSection
+from app.models.payment import Payment
 from app.models.personal_purchase import PersonalPurchase
 from app.models.rate_limit_bucket import RateLimitBucket
 from app.models.plan import Plan
@@ -23,6 +24,7 @@ from app.models.plan_feature import PlanFeature
 from app.models.subscription import Subscription
 from app.models.workspace import Workspace, WorkspaceMember
 from app.modules.auth.models.refresh_token import RefreshToken
+from app.modules.entitlements.services.entitlement_resolver import EntitlementResolver
 from app.modules.invitations.models.invitation import Invitation
 from app.modules.templates.models.template import Template
 from app.modules.users.models.user import User
@@ -53,6 +55,7 @@ def invitation_context():
         Invitation.__table__,
         InvitationSection.__table__,
         PersonalPurchase.__table__,
+        Payment.__table__,
         Subscription.__table__,
         EntitlementOverride.__table__,
         RateLimitBucket.__table__,
@@ -127,6 +130,7 @@ def invitation_context():
             code="personal-premium",
             name="Personal Premium",
             billing_type="one_time",
+            duration_type="fixed",
             price=9.99,
             currency="USD",
             duration_days=365,
@@ -135,6 +139,7 @@ def invitation_context():
             code="workspace-premium",
             name="Workspace Premium",
             billing_type="subscription",
+            duration_type="recurring",
             price=19.99,
             currency="USD",
         )
@@ -573,6 +578,51 @@ def test_personal_purchase_must_be_active_and_unexpired(
     assert title_update.status_code == 200
 
 
+def test_deactivated_plan_preserves_existing_purchase_but_blocks_new_purchase(
+    invitation_context,
+):
+    _, session_factory, ids = invitation_context
+    invitation_id = uuid4()
+    now = datetime.now(timezone.utc)
+    with session_factory() as session:
+        invitation = Invitation(
+            id=invitation_id,
+            owner_id=ids["users"][0],
+            template_id=ids["template"],
+            title="Existing premium invitation",
+            slug="existing-premium-invitation",
+            status="draft",
+        )
+        purchase = PersonalPurchase(
+            user_id=ids["users"][0],
+            invitation_id=invitation.id,
+            plan_id=ids["personal_plan"],
+            status="active",
+            activated_at=now - timedelta(days=1),
+            expires_at=now + timedelta(days=30),
+            duration_type_snapshot="fixed",
+            duration_days_snapshot=30,
+            purchased_price=9.99,
+            purchased_currency="USD",
+        )
+        plan = session.get(Plan, ids["personal_plan"])
+        session.add_all([invitation, purchase])
+        session.commit()
+
+        plan.is_active = False
+        session.commit()
+        decision = EntitlementResolver(session).evaluate_feature_access(
+            "premium_templates",
+            user_id=ids["users"][0],
+            invitation_id=invitation.id,
+        )
+
+        assert decision.allowed is True
+        assert decision.expires_at == purchase.expires_at
+        with pytest.raises(ValueError, match="active one-time plan"):
+            PersonalPurchase.pending_from_plan(ids["users"][0], plan)
+
+
 def test_workspace_template_access_requires_current_matching_subscription(
     invitation_context,
 ):
@@ -727,6 +777,191 @@ def test_entitlement_overrides_apply_to_their_exact_scope(invitation_context):
         ids["premium_template"],
     )
     assert workspace_create.status_code == 201, workspace_create.text
+
+
+def test_entitlement_decision_is_personal_invitation_scoped(invitation_context):
+    client, session_factory, ids = invitation_context
+    _login(client, "owner@example.com")
+    response = _create_personal(client, ids["template"])
+    assert response.status_code == 201
+    invitation_id = UUID(response.json()["id"])
+    now = datetime.now(timezone.utc)
+
+    with session_factory() as session:
+        session.add(
+            PersonalPurchase(
+                user_id=ids["users"][0],
+                invitation_id=invitation_id,
+                plan_id=ids["personal_plan"],
+                status="active",
+                activated_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=30),
+            )
+        )
+        session.commit()
+        decision = EntitlementResolver(session).evaluate_feature_access(
+            "premium_templates",
+            user_id=ids["users"][0],
+            invitation_id=invitation_id,
+        )
+        cross_invitation = EntitlementResolver(session).evaluate_feature_access(
+            "premium_templates",
+            user_id=ids["users"][0],
+            invitation_id=UUID(int=0),
+        )
+
+    assert decision.allowed is True
+    assert decision.reason == "active_plan_feature"
+    assert decision.source == "personal_purchase"
+    assert decision.plan_code == "personal-premium"
+    assert decision.expires_at is not None
+    assert decision.expires_at.replace(tzinfo=timezone.utc) == now + timedelta(days=30)
+    assert cross_invitation.allowed is False
+    assert cross_invitation.reason == "invitation_scope_mismatch"
+
+
+def test_entitlement_decision_resolves_feature_limits_and_overrides(invitation_context):
+    client, session_factory, ids = invitation_context
+    _login(client, "owner@example.com")
+    response = _create_personal(client, ids["template"])
+    assert response.status_code == 201
+    invitation_id = UUID(response.json()["id"])
+    now = datetime.now(timezone.utc)
+
+    with session_factory() as session:
+        feature = Feature(
+            code="guest_limit",
+            name="Guest limit",
+            feature_type="limit",
+        )
+        session.add(feature)
+        session.flush()
+        session.add_all(
+            [
+                PlanFeature(
+                    plan_id=ids["personal_plan"],
+                    feature_id=feature.id,
+                    configuration={"limit": 4},
+                ),
+                PersonalPurchase(
+                    user_id=ids["users"][0],
+                    invitation_id=invitation_id,
+                    plan_id=ids["personal_plan"],
+                    status="active",
+                    activated_at=now - timedelta(days=1),
+                    expires_at=now + timedelta(days=30),
+                ),
+            ]
+        )
+        session.commit()
+
+        resolver = EntitlementResolver(session)
+        initial = resolver.evaluate_feature_access(
+            "guest_limit",
+            user_id=ids["users"][0],
+            invitation_id=invitation_id,
+        )
+        session.add(
+            EntitlementOverride(
+                invitation_id=invitation_id,
+                feature_id=feature.id,
+                limit_override={"limit": 7},
+                expires_at=now + timedelta(days=1),
+            )
+        )
+        session.commit()
+        overridden = resolver.evaluate_feature_access(
+            "guest_limit",
+            user_id=ids["users"][0],
+            invitation_id=invitation_id,
+        )
+
+    assert initial.allowed is True
+    assert initial.limit == 4
+    assert overridden.allowed is True
+    assert overridden.limit == 7
+
+
+def test_expired_override_is_ignored_and_disabled_override_revokes_access(
+    invitation_context,
+):
+    client, session_factory, ids = invitation_context
+    _login(client, "owner@example.com")
+    response = _create_personal(client, ids["template"])
+    assert response.status_code == 201
+    invitation_id = UUID(response.json()["id"])
+    now = datetime.now(timezone.utc)
+
+    with session_factory() as session:
+        session.add(
+            EntitlementOverride(
+                invitation_id=invitation_id,
+                feature_id=ids["premium_feature"],
+                is_enabled=True,
+                expires_at=now - timedelta(seconds=1),
+            )
+        )
+        session.commit()
+        resolver = EntitlementResolver(session)
+        expired = resolver.evaluate_feature_access(
+            "premium_templates",
+            user_id=ids["users"][0],
+            invitation_id=invitation_id,
+        )
+        session.add(
+            EntitlementOverride(
+                invitation_id=invitation_id,
+                feature_id=ids["premium_feature"],
+                is_enabled=False,
+                reason="revoked",
+                expires_at=now + timedelta(days=1),
+            )
+        )
+        session.commit()
+        revoked = resolver.evaluate_feature_access(
+            "premium_templates",
+            user_id=ids["users"][0],
+            invitation_id=invitation_id,
+        )
+
+    assert expired.allowed is False
+    assert expired.reason == "no_active_plan_feature"
+    assert revoked.allowed is False
+    assert revoked.reason == "disabled_by_override"
+    assert revoked.source == "override"
+
+
+def test_workspace_entitlement_requires_active_membership(invitation_context):
+    _, session_factory, ids = invitation_context
+    now = datetime.now(timezone.utc)
+    with session_factory() as session:
+        session.add(
+            Subscription(
+                workspace_id=ids["workspace_one"],
+                plan_id=ids["workspace_plan"],
+                status="active",
+                current_period_start=now - timedelta(days=1),
+                current_period_end=now + timedelta(days=30),
+                cancel_at_period_end=False,
+            )
+        )
+        session.commit()
+        resolver = EntitlementResolver(session)
+        member = resolver.evaluate_feature_access(
+            "premium_templates",
+            user_id=ids["users"][2],
+            workspace_id=ids["workspace_one"],
+        )
+        outsider = resolver.evaluate_feature_access(
+            "premium_templates",
+            user_id=ids["users"][4],
+            workspace_id=ids["workspace_one"],
+        )
+
+    assert member.allowed is True
+    assert member.source == "workspace_subscription"
+    assert outsider.allowed is False
+    assert outsider.reason == "no_active_workspace_membership"
 
 
 def test_premium_template_requires_published_and_active_state(
