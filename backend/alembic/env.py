@@ -7,6 +7,10 @@ from alembic import context
 
 from app.core.config import settings
 from app.database.base import Base
+from app.database.isolation import (
+    require_test_database_connection,
+    require_test_database_url,
+)
 import app.models  # noqa: F401
 
 config = context.config
@@ -14,10 +18,11 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Ambil URL database dari .env
+# Environment variables override .env; reject unsafe targets before creating an engine.
+database_url = require_test_database_url(settings.DATABASE_URL)
 config.set_main_option(
     "sqlalchemy.url",
-    settings.DATABASE_URL.replace("%", "%%")
+    database_url.replace("%", "%%")
 )
 
 # Metadata seluruh model SQLAlchemy
@@ -47,6 +52,7 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        require_test_database_connection(connection)
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
