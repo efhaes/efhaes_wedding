@@ -149,6 +149,8 @@ class BillingService:
                 )
         for existing in expired_subscriptions:
             existing.status = "expired"
+            existing.current_period_start = None
+            existing.current_period_end = None
 
         snapshot = self.repository.snapshot_plan_features(plan.id)
         subscription = Subscription(

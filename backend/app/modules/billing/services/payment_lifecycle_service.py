@@ -209,6 +209,8 @@ class PaymentLifecycleService:
                 )
         for existing in expired_subscriptions:
             existing.status = "expired"
+            existing.current_period_start = None
+            existing.current_period_end = None
         self._flush()
         target.current_period_start = paid_at
         target.current_period_end = paid_at + timedelta(
@@ -239,6 +241,9 @@ class PaymentLifecycleService:
                 detail="Only an active transaction can be refunded",
             )
         target.status = "refunded"
+        if isinstance(target, Subscription):
+            target.current_period_start = None
+            target.current_period_end = None
         payment.status = "refunded"
         self._commit()
         return payment

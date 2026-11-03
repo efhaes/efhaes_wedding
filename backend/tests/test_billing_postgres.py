@@ -1,6 +1,6 @@
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Barrier
 from uuid import uuid4
@@ -279,20 +279,22 @@ def test_postgres_concurrent_subscription_and_mapping_change_snapshot_is_whole(
             currency="USD",
             is_active=True,
         )
-        workspace = Workspace(
-            name="Subscription race workspace",
-            slug=f"subscription-race-{suffix}",
-            owner_id=user.id,
-            status="active",
-        )
-        membership = WorkspaceMember(
-            workspace=workspace,
-            user_id=user.id,
-            role="owner",
-            status="active",
-        )
         with factory() as session:
-            session.add_all([user, feature, plan, workspace, membership])
+            session.add_all([user, feature, plan])
+            session.flush()
+            workspace = Workspace(
+                name="Subscription race workspace",
+                slug=f"subscription-race-{suffix}",
+                owner_id=user.id,
+                status="active",
+            )
+            membership = WorkspaceMember(
+                workspace=workspace,
+                user_id=user.id,
+                role="owner",
+                status="active",
+            )
+            session.add_all([workspace, membership])
             session.flush()
             mapping = PlanFeature(
                 plan_id=plan.id,
@@ -387,6 +389,182 @@ def test_postgres_concurrent_subscription_and_mapping_change_snapshot_is_whole(
                 session.execute(
                     delete(User).where(User.id == ids.get("user_id"))
                 )
+                session.commit()
+
+
+def test_postgres_subscription_terminal_transitions_clear_periods(postgres_engine):
+    factory = _session_factory(postgres_engine)
+    ids: dict[str, object] = {}
+    subscription_ids = []
+    try:
+        with factory() as session:
+            suffix = uuid4().hex
+            user = User(
+                name="Subscription terminal user",
+                email=f"subscription-terminal-{suffix}@example.invalid",
+                password_hash="integration-test-only",
+            )
+            feature = Feature(
+                code=f"subscription_terminal_feature_{suffix}",
+                name="Subscription terminal feature",
+                feature_type="limit",
+                is_active=True,
+            )
+            plan = Plan(
+                code=f"pg-subscription-terminal-{suffix}",
+                name="Subscription terminal plan",
+                billing_type="subscription",
+                duration_type="recurring",
+                billing_period_days=30,
+                price=Decimal("50.00"),
+                currency="USD",
+                is_active=True,
+            )
+            session.add_all([user, feature, plan])
+            session.flush()
+            workspace = Workspace(
+                name="Subscription terminal workspace",
+                slug=f"subscription-terminal-{suffix}",
+                owner_id=user.id,
+                status="active",
+            )
+            membership = WorkspaceMember(
+                workspace=workspace,
+                user_id=user.id,
+                role="owner",
+                status="active",
+            )
+            mapping = PlanFeature(
+                plan_id=plan.id,
+                feature_id=feature.id,
+                is_enabled=True,
+                configuration={"limit": 4},
+            )
+            session.add_all([workspace, membership, mapping])
+            session.flush()
+            ids.update(
+                user_id=user.id,
+                feature_id=feature.id,
+                plan_id=plan.id,
+                workspace_id=workspace.id,
+                membership_id=membership.id,
+                mapping_id=mapping.id,
+            )
+            session.commit()
+
+        with factory() as session:
+            now = datetime.now(timezone.utc)
+            expired_on_creation = Subscription(
+                workspace_id=ids["workspace_id"],
+                plan_id=ids["plan_id"],
+                status="active",
+                current_period_start=now - timedelta(days=31),
+                current_period_end=now - timedelta(days=1),
+                billing_period_days_snapshot=30,
+                purchased_price=Decimal("50.00"),
+                purchased_currency="USD",
+                entitlement_snapshot={"version": 1, "features": {}},
+            )
+            session.add(expired_on_creation)
+            session.flush()
+            subscription_ids.append(expired_on_creation.id)
+            session.commit()
+
+        with factory() as session:
+            created = BillingService(session).create_workspace_subscription(
+                session.get(User, ids["user_id"]),
+                ids["workspace_id"],
+                ids["plan_id"],
+            )
+            subscription_ids.append(created.id)
+            ids["payment_id"] = created.payment.id
+            expired = session.get(Subscription, subscription_ids[0])
+            pending = session.get(Subscription, created.id)
+            assert expired.status == "expired"
+            assert expired.current_period_start is None
+            assert expired.current_period_end is None
+            assert pending.status == "pending"
+            assert pending.current_period_start is None
+            assert pending.current_period_end is None
+
+        with factory() as session:
+            now = datetime.now(timezone.utc)
+            expired_on_settlement = Subscription(
+                workspace_id=ids["workspace_id"],
+                plan_id=ids["plan_id"],
+                status="active",
+                current_period_start=now - timedelta(days=31),
+                current_period_end=now - timedelta(days=1),
+                billing_period_days_snapshot=30,
+                purchased_price=Decimal("50.00"),
+                purchased_currency="USD",
+                entitlement_snapshot={"version": 1, "features": {}},
+            )
+            session.add(expired_on_settlement)
+            session.flush()
+            subscription_ids.append(expired_on_settlement.id)
+            session.commit()
+
+        paid_at = datetime.now(timezone.utc)
+        with factory() as session:
+            PaymentLifecycleService(session).record_verified_outcome(
+                ids["payment_id"],
+                VerifiedPaymentOutcome(status="paid", paid_at=paid_at),
+            )
+            expired = session.get(Subscription, subscription_ids[2])
+            active = session.get(Subscription, subscription_ids[1])
+            assert expired.status == "expired"
+            assert expired.current_period_start is None
+            assert expired.current_period_end is None
+            assert active.status == "active"
+            assert active.current_period_start.astimezone(timezone.utc) == paid_at
+            assert active.current_period_end.astimezone(timezone.utc) == (
+                paid_at + timedelta(days=30)
+            )
+            snapshot = active.entitlement_snapshot
+
+            PaymentLifecycleService(session).record_verified_outcome(
+                ids["payment_id"],
+                VerifiedPaymentOutcome(status="refunded"),
+            )
+            refunded = session.get(Subscription, active.id)
+            payment = session.get(Payment, ids["payment_id"])
+            assert refunded.status == "refunded"
+            assert refunded.current_period_start is None
+            assert refunded.current_period_end is None
+            assert refunded.entitlement_snapshot == snapshot
+            assert payment.status == "refunded"
+    finally:
+        if ids:
+            with Session(postgres_engine) as session:
+                session.execute(
+                    delete(Payment).where(
+                        Payment.subscription_id.in_(subscription_ids)
+                    )
+                )
+                session.execute(
+                    delete(Subscription).where(
+                        Subscription.id.in_(subscription_ids)
+                    )
+                )
+                session.execute(
+                    delete(PlanFeature).where(PlanFeature.id == ids.get("mapping_id"))
+                )
+                session.execute(
+                    delete(WorkspaceMember).where(
+                        WorkspaceMember.id == ids.get("membership_id")
+                    )
+                )
+                session.execute(
+                    delete(Workspace).where(
+                        Workspace.id == ids.get("workspace_id")
+                    )
+                )
+                session.execute(
+                    delete(Feature).where(Feature.id == ids.get("feature_id"))
+                )
+                session.execute(delete(Plan).where(Plan.id == ids.get("plan_id")))
+                session.execute(delete(User).where(User.id == ids.get("user_id")))
                 session.commit()
 
 

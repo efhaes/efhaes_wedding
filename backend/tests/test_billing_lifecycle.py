@@ -5,7 +5,7 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
@@ -206,6 +206,28 @@ def _invitation(session, owner: User, template: Template) -> Invitation:
     session.add(invitation)
     session.commit()
     return invitation
+
+
+def _workspace(session, owner: User) -> Workspace:
+    workspace = Workspace(
+        name="Subscription lifecycle workspace",
+        slug=f"subscription-lifecycle-{uuid4().hex}",
+        owner_id=owner.id,
+        status="active",
+    )
+    session.add_all(
+        [
+            workspace,
+            WorkspaceMember(
+                workspace=workspace,
+                user_id=owner.id,
+                role="owner",
+                status="active",
+            ),
+        ]
+    )
+    session.commit()
+    return workspace
 
 
 def test_personal_purchase_snapshots_features_and_settlement_is_idempotent(
@@ -571,6 +593,64 @@ def test_workspace_plan_requires_explicit_billing_period(billing_context):
             )
         assert invalid.value.status_code == 409
         session.rollback()
+
+
+def test_subscription_refund_clears_dates_and_failed_refund_rolls_back(
+    billing_context,
+):
+    context = billing_context
+    with context["session_factory"]() as session:
+        workspace = _workspace(session, context["owner"])
+        created = BillingService(session).create_workspace_subscription(
+            context["owner"], workspace.id, context["workspace_plan"].id
+        )
+        paid_at = datetime.now(timezone.utc)
+        PaymentLifecycleService(session).record_verified_outcome(
+            created.payment.id,
+            VerifiedPaymentOutcome(status="paid", paid_at=paid_at),
+        )
+        active = session.get(Subscription, created.id)
+        snapshot = active.entitlement_snapshot
+        period_start = active.current_period_start
+        period_end = active.current_period_end
+        payment = session.get(Payment, created.payment.id)
+
+        def fail_refund_commit(_session, _flush_context, _instances):
+            payment.status = "invalid"
+
+        event.listen(session, "before_flush", fail_refund_commit)
+        try:
+            with pytest.raises(HTTPException) as failed_refund:
+                PaymentLifecycleService(session).record_verified_outcome(
+                    payment.id,
+                    VerifiedPaymentOutcome(status="refunded"),
+                )
+        finally:
+            event.remove(session, "before_flush", fail_refund_commit)
+        assert failed_refund.value.status_code == 409
+
+        active = session.get(Subscription, created.id)
+        payment = session.get(Payment, created.payment.id)
+        assert active.status == "active"
+        assert active.current_period_start.replace(tzinfo=timezone.utc) == (
+            period_start.replace(tzinfo=timezone.utc)
+        )
+        assert active.current_period_end.replace(tzinfo=timezone.utc) == (
+            period_end.replace(tzinfo=timezone.utc)
+        )
+        assert payment.status == "paid"
+
+        PaymentLifecycleService(session).record_verified_outcome(
+            payment.id,
+            VerifiedPaymentOutcome(status="refunded"),
+        )
+        refunded = session.get(Subscription, created.id)
+        payment = session.get(Payment, created.payment.id)
+        assert refunded.status == "refunded"
+        assert refunded.current_period_start is None
+        assert refunded.current_period_end is None
+        assert refunded.entitlement_snapshot == snapshot
+        assert payment.status == "refunded"
 
 
 def test_billing_api_is_read_only_for_payment_status_and_owner_scoped(
