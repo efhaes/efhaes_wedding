@@ -149,10 +149,6 @@ def test_postgres_personal_snapshot_and_catalog_update_are_transactional(
             user, feature, plan, template, invitation, mapping = _personal_fixture(
                 session, code="pg-personal"
             )
-            purchase = BillingService(session).create_personal_purchase(user, plan.id)
-            stored = session.get(PersonalPurchase, purchase.id)
-            stored.invitation_id = invitation.id
-            session.commit()
             ids.update(
                 user_id=user.id,
                 feature_id=feature.id,
@@ -160,9 +156,15 @@ def test_postgres_personal_snapshot_and_catalog_update_are_transactional(
                 template_id=template.id,
                 invitation_id=invitation.id,
                 mapping_id=mapping.id,
+            )
+            purchase = BillingService(session).create_personal_purchase(user, plan.id)
+            ids.update(
                 purchase_id=purchase.id,
                 payment_id=purchase.payment.id,
             )
+            stored = session.get(PersonalPurchase, purchase.id)
+            stored.invitation_id = invitation.id
+            session.commit()
             assert stored.status == "pending"
             assert stored.entitlement_snapshot["features"][feature.code][
                 "configuration"
@@ -396,7 +398,6 @@ def test_postgres_concurrent_payment_success_activates_once(postgres_engine):
             user, feature, plan, template, invitation, mapping = _personal_fixture(
                 session, code="pg-race-payment"
             )
-            purchase = BillingService(session).create_personal_purchase(user, plan.id)
             ids.update(
                 user_id=user.id,
                 feature_id=feature.id,
@@ -404,6 +405,9 @@ def test_postgres_concurrent_payment_success_activates_once(postgres_engine):
                 template_id=template.id,
                 invitation_id=invitation.id,
                 mapping_id=mapping.id,
+            )
+            purchase = BillingService(session).create_personal_purchase(user, plan.id)
+            ids.update(
                 purchase_id=purchase.id,
                 payment_id=purchase.payment.id,
             )
