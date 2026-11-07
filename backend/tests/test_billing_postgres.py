@@ -1,4 +1,5 @@
 import os
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -6,22 +7,40 @@ from threading import Barrier
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import delete, select, text
+from fastapi import HTTPException
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy import create_engine
 
+from app.models.billing_idempotency_record import BillingIdempotencyRecord
+from app.models.checkout_attempt import CheckoutAttempt, CheckoutAttemptHistory
 from app.models.feature import Feature
 from app.models.payment import Payment
+from app.models.payment_webhook_event import PaymentWebhookEvent
 from app.models.personal_purchase import PersonalPurchase
 from app.models.plan import Plan
 from app.models.plan_feature import PlanFeature
 from app.models.subscription import Subscription
 from app.models.workspace import Workspace, WorkspaceMember
 from app.modules.billing.services.billing_service import BillingService
+from app.modules.billing.services.checkout_foundation_service import (
+    CheckoutFoundationService,
+)
 from app.modules.billing.services.payment_lifecycle_service import (
     PaymentLifecycleService,
     VerifiedPaymentOutcome,
+)
+from app.core.config import Settings
+from app.modules.billing.services.midtrans_client import MidtransTransactionStatus
+from app.modules.billing.services.midtrans_verification_service import (
+    MidtransProviderVerifier,
+)
+from app.modules.billing.services.midtrans_webhook_service import (
+    MidtransWebhookService,
+)
+from app.modules.billing.services.provider_event_identity import (
+    build_provider_event_id,
 )
 from app.modules.entitlements.schemas.admin_catalog import PlanFeatureUpdate
 from app.modules.entitlements.services.catalog_admin_service import (
@@ -62,6 +81,81 @@ def postgres_engine():
 
 def _session_factory(engine):
     return sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def _webhook_settings() -> Settings:
+    return Settings(
+        _env_file=None,
+        DATABASE_URL="postgresql://unused/efhaeswedding_test",
+        JWT_SECRET_KEY="test-secret-with-more-than-thirty-two-characters",
+        MIDTRANS_SERVER_KEY="unit-server-key",
+        MIDTRANS_CURRENCY="USD",
+    )
+
+
+def _signed_webhook(order_id: str, transaction_status: str) -> dict[str, str]:
+    notification = {
+        "order_id": order_id,
+        "status_code": "200",
+        "gross_amount": "10.00",
+        "transaction_id": "provider-transaction-123",
+        "transaction_status": transaction_status,
+        "currency": "USD",
+        "fraud_status": "accept",
+        "payment_type": "bank_transfer",
+    }
+    notification["signature_key"] = hashlib.sha512(
+        (
+            notification["order_id"]
+            + notification["status_code"]
+            + notification["gross_amount"]
+            + "unit-server-key"
+        ).encode("utf-8")
+    ).hexdigest()
+    return notification
+
+
+class _CurrentMidtransStatus:
+    def __init__(self, *, order_id: str, transaction_status: str = "settlement"):
+        self.calls = 0
+        self.transaction = MidtransTransactionStatus(
+            order_id=order_id,
+            transaction_id="provider-transaction-123",
+            transaction_status=transaction_status,
+            status_code="200",
+            gross_amount=Decimal("10.00"),
+            currency="USD",
+            fraud_status="accept",
+            payment_type="bank_transfer",
+            transaction_time="2026-11-04 10:00:00",
+        )
+
+    def get_transaction_status(self, *, order_id, transaction_id=None):
+        self.calls += 1
+        assert order_id == self.transaction.order_id
+        assert transaction_id == self.transaction.transaction_id
+        return self.transaction
+
+
+def _create_midtrans_payment(factory, ids):
+    with factory() as session:
+        user, _feature, plan, _template, _invitation, _mapping = _personal_fixture(
+            session, code="pg-midtrans-webhook"
+        )
+        purchase = BillingService(session).create_personal_purchase(
+            user, plan.id, f"pg-purchase-{uuid4().hex}"
+        )
+        payment = session.get(Payment, purchase.payment.id)
+        order_id = f"pg-midtrans-{uuid4().hex}"
+        payment.provider = "midtrans"
+        payment.provider_order_id = order_id
+        session.commit()
+        ids.update(
+            user_id=user.id,
+            purchase_id=purchase.id,
+            payment_id=payment.id,
+        )
+    return order_id
 
 
 def _personal_fixture(session: Session, *, code: str):
@@ -118,10 +212,33 @@ def _personal_fixture(session: Session, *, code: str):
 
 def _cleanup_personal(engine, ids: dict[str, object]) -> None:
     with Session(engine) as session:
-        session.execute(delete(Payment).where(Payment.id == ids.get("payment_id")))
+        payment_ids = select(Payment.id).where(
+            Payment.personal_purchase_id.in_(
+                select(PersonalPurchase.id).where(
+                    PersonalPurchase.user_id == ids.get("user_id")
+                )
+            )
+        )
+        attempt_ids = select(CheckoutAttempt.id).where(
+            CheckoutAttempt.payment_id.in_(payment_ids)
+        )
+        session.execute(
+            delete(BillingIdempotencyRecord).where(
+                BillingIdempotencyRecord.user_id == ids.get("user_id")
+            )
+        )
+        session.execute(
+            delete(CheckoutAttemptHistory).where(
+                CheckoutAttemptHistory.attempt_id.in_(attempt_ids)
+            )
+        )
+        session.execute(
+            delete(CheckoutAttempt).where(CheckoutAttempt.id.in_(attempt_ids))
+        )
+        session.execute(delete(Payment).where(Payment.id.in_(payment_ids)))
         session.execute(
             delete(PersonalPurchase).where(
-                PersonalPurchase.id == ids.get("purchase_id")
+                PersonalPurchase.user_id == ids.get("user_id")
             )
         )
         session.execute(
@@ -137,6 +254,243 @@ def _cleanup_personal(engine, ids: dict[str, object]) -> None:
         session.execute(delete(Plan).where(Plan.id == ids.get("plan_id")))
         session.execute(delete(User).where(User.id == ids.get("user_id")))
         session.commit()
+
+
+def test_postgres_concurrent_idempotency_claim_returns_one_purchase(
+    postgres_engine,
+):
+    factory = _session_factory(postgres_engine)
+    ids: dict[str, object] = {}
+    try:
+        with factory() as session:
+            user, _feature, plan, _template, _invitation, _mapping = (
+                _personal_fixture(session, code="pg-idempotency-race")
+            )
+            ids.update(user_id=user.id)
+            user_id, plan_id = user.id, plan.id
+
+        barrier = Barrier(2)
+        key = f"pg-same-key-{uuid4().hex}"
+
+        def create_purchase():
+            with factory() as session:
+                user_row = session.get(User, user_id)
+                barrier.wait(timeout=10)
+                purchase = BillingService(session).create_personal_purchase(
+                    user_row, plan_id, key
+                )
+                return purchase.id, purchase.payment.id
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _index: create_purchase(), range(2)))
+
+        assert results[0] == results[1]
+        ids.update(purchase_id=results[0][0], payment_id=results[0][1])
+        with factory() as session:
+            assert session.scalar(
+                select(PersonalPurchase.id).where(
+                    PersonalPurchase.id == results[0][0]
+                )
+            ) == results[0][0]
+            assert session.scalar(
+                select(BillingIdempotencyRecord.replay_count).where(
+                    BillingIdempotencyRecord.user_id == user_id,
+                    BillingIdempotencyRecord.operation == "personal_purchase",
+                )
+            ) == 1
+    finally:
+        if ids:
+            _cleanup_personal(postgres_engine, ids)
+
+
+def test_postgres_concurrent_checkout_claim_creates_one_attempt(postgres_engine):
+    factory = _session_factory(postgres_engine)
+    ids: dict[str, object] = {}
+    try:
+        with factory() as session:
+            user, _feature, plan, _template, _invitation, _mapping = (
+                _personal_fixture(session, code="pg-checkout-race")
+            )
+            ids.update(user_id=user.id)
+            purchase = BillingService(session).create_personal_purchase(
+                user, plan.id, f"pg-purchase-{uuid4().hex}"
+            )
+            ids.update(
+                purchase_id=purchase.id,
+                payment_id=purchase.payment.id,
+            )
+            user_id, payment_id = user.id, purchase.payment.id
+
+        barrier = Barrier(2)
+
+        def claim_checkout(index: int):
+            with factory() as session:
+                user_row = session.get(User, user_id)
+                barrier.wait(timeout=10)
+                attempt = CheckoutFoundationService(session).claim_attempt(
+                    user_row,
+                    payment_id,
+                    f"pg-checkout-key-{index}-{uuid4().hex}",
+                    worker_id=f"pg-checkout-worker-{index}",
+                )
+                return attempt.id, attempt.provider_order_id
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(claim_checkout, (1, 2)))
+
+        assert results[0] == results[1]
+        with factory() as session:
+            assert session.scalar(
+                select(CheckoutAttempt.id).where(
+                    CheckoutAttempt.payment_id == payment_id
+                )
+            ) == results[0][0]
+            assert session.scalar(
+                select(CheckoutAttemptHistory.id).where(
+                    CheckoutAttemptHistory.attempt_id == results[0][0],
+                    CheckoutAttemptHistory.event_type == "created",
+                )
+            ) is not None
+    finally:
+        if ids:
+            _cleanup_personal(postgres_engine, ids)
+
+
+def test_postgres_stale_checkout_fencing_generation_cannot_mutate_attempt(
+    postgres_engine,
+):
+    factory = _session_factory(postgres_engine)
+    ids: dict[str, object] = {}
+    started_at = datetime(2026, 11, 4, 10, 0, tzinfo=timezone.utc)
+    try:
+        with factory() as session:
+            user, _feature, plan, _template, _invitation, _mapping = (
+                _personal_fixture(session, code="pg-checkout-fencing")
+            )
+            ids.update(user_id=user.id)
+            purchase = BillingService(session).create_personal_purchase(
+                user, plan.id, f"pg-purchase-{uuid4().hex}"
+            )
+            ids.update(
+                purchase_id=purchase.id,
+                payment_id=purchase.payment.id,
+            )
+            attempt = CheckoutFoundationService(session).claim_attempt(
+                user,
+                purchase.payment.id,
+                f"pg-checkout-key-{uuid4().hex}",
+                worker_id="pg-stale-worker",
+                lease_duration=timedelta(seconds=5),
+                now=started_at,
+            )
+            attempt_id = attempt.id
+
+        with factory() as session:
+            recovered = CheckoutFoundationService(session).claim_reconciliation_lease(
+                attempt_id,
+                worker_id="pg-current-worker",
+                lease_duration=timedelta(seconds=30),
+                now=started_at + timedelta(seconds=6),
+            )
+            assert recovered.fencing_generation == 2
+            assert recovered.lease_owner == "pg-current-worker"
+
+        with factory() as session:
+            with pytest.raises(HTTPException) as stale_worker:
+                CheckoutFoundationService(session).mark_indeterminate(
+                    attempt_id,
+                    worker_id="pg-stale-worker",
+                    fencing_generation=1,
+                    reason_code="stale_result",
+                    now=started_at + timedelta(seconds=7),
+                )
+            assert stale_worker.value.status_code == 409
+            attempt = session.get(CheckoutAttempt, attempt_id)
+            assert attempt.status == "indeterminate"
+            assert attempt.fencing_generation == 2
+            assert attempt.lease_owner == "pg-current-worker"
+    finally:
+        if ids:
+            _cleanup_personal(postgres_engine, ids)
+
+
+def test_postgres_duplicate_midtrans_webhook_is_processed_once(postgres_engine):
+    factory = _session_factory(postgres_engine)
+    ids: dict[str, object] = {}
+    try:
+        order_id = _create_midtrans_payment(factory, ids)
+        provider = _CurrentMidtransStatus(order_id=order_id)
+        settings = _webhook_settings()
+        payload = _signed_webhook(order_id, "settlement")
+
+        with factory() as session:
+            response = MidtransWebhookService(
+                session,
+                settings,
+                MidtransProviderVerifier(settings, provider),
+            ).process(payload)
+        assert response == {"received": True}
+
+        with factory() as session:
+            response = MidtransWebhookService(
+                session,
+                settings,
+                MidtransProviderVerifier(settings, provider),
+            ).process(payload)
+            assert response == {"received": True}
+            assert provider.calls == 1
+            assert session.scalar(
+                select(func.count()).select_from(PaymentWebhookEvent).where(
+                    PaymentWebhookEvent.provider_event_id
+                    == build_provider_event_id("midtrans", payload)
+                )
+            ) == 1
+            payment = session.get(Payment, ids["payment_id"])
+            purchase = session.get(PersonalPurchase, ids["purchase_id"])
+            assert payment.status == "paid"
+            assert purchase.status == "active"
+    finally:
+        if ids:
+            _cleanup_personal(postgres_engine, ids)
+
+
+def test_postgres_out_of_order_midtrans_notifications_use_current_status(
+    postgres_engine,
+):
+    factory = _session_factory(postgres_engine)
+    ids: dict[str, object] = {}
+    try:
+        order_id = _create_midtrans_payment(factory, ids)
+        provider = _CurrentMidtransStatus(order_id=order_id)
+        settings = _webhook_settings()
+        notifications = (
+            _signed_webhook(order_id, "pending"),
+            _signed_webhook(order_id, "settlement"),
+        )
+
+        for payload in notifications:
+            with factory() as session:
+                MidtransWebhookService(
+                    session,
+                    settings,
+                    MidtransProviderVerifier(settings, provider),
+                ).process(payload)
+
+        with factory() as session:
+            payment = session.get(Payment, ids["payment_id"])
+            purchase = session.get(PersonalPurchase, ids["purchase_id"])
+            assert payment.status == "paid"
+            assert purchase.status == "active"
+            assert session.scalar(
+                select(func.count()).select_from(PaymentWebhookEvent).where(
+                    PaymentWebhookEvent.payment_id == ids["payment_id"],
+                    PaymentWebhookEvent.processing_status == "processed",
+                )
+            ) == 2
+            assert provider.calls == 2
+    finally:
+        if ids:
+            _cleanup_personal(postgres_engine, ids)
 
 
 def test_postgres_personal_snapshot_and_catalog_update_are_transactional(
@@ -157,7 +511,9 @@ def test_postgres_personal_snapshot_and_catalog_update_are_transactional(
                 invitation_id=invitation.id,
                 mapping_id=mapping.id,
             )
-            purchase = BillingService(session).create_personal_purchase(user, plan.id)
+            purchase = BillingService(session).create_personal_purchase(
+                user, plan.id, uuid4().hex
+            )
             ids.update(
                 purchase_id=purchase.id,
                 payment_id=purchase.payment.id,
@@ -217,7 +573,7 @@ def test_postgres_concurrent_purchase_and_mapping_change_snapshot_is_whole(
                 user = session.get(User, user_id)
                 barrier.wait(timeout=10)
                 return BillingService(session).create_personal_purchase(
-                    user, plan_id
+                    user, plan_id, uuid4().hex
                 )
 
         def change_mapping():
@@ -325,7 +681,7 @@ def test_postgres_concurrent_subscription_and_mapping_change_snapshot_is_whole(
                 user_row = session.get(User, user_id)
                 barrier.wait(timeout=10)
                 return BillingService(session).create_workspace_subscription(
-                    user_row, workspace_id, plan_id
+                    user_row, workspace_id, plan_id, uuid4().hex
                 )
 
         def change_mapping():
@@ -357,6 +713,11 @@ def test_postgres_concurrent_subscription_and_mapping_change_snapshot_is_whole(
     finally:
         if ids:
             with Session(postgres_engine) as session:
+                session.execute(
+                    delete(BillingIdempotencyRecord).where(
+                        BillingIdempotencyRecord.user_id == ids.get("user_id")
+                    )
+                )
                 session.execute(
                     delete(Payment).where(Payment.id == ids.get("payment_id"))
                 )
@@ -475,6 +836,7 @@ def test_postgres_subscription_terminal_transitions_clear_periods(postgres_engin
                 session.get(User, ids["user_id"]),
                 ids["workspace_id"],
                 ids["plan_id"],
+                uuid4().hex,
             )
             subscription_ids.append(created.id)
             ids["payment_id"] = created.payment.id
@@ -538,6 +900,11 @@ def test_postgres_subscription_terminal_transitions_clear_periods(postgres_engin
         if ids:
             with Session(postgres_engine) as session:
                 session.execute(
+                    delete(BillingIdempotencyRecord).where(
+                        BillingIdempotencyRecord.user_id == ids.get("user_id")
+                    )
+                )
+                session.execute(
                     delete(Payment).where(
                         Payment.subscription_id.in_(subscription_ids)
                     )
@@ -584,7 +951,9 @@ def test_postgres_concurrent_payment_success_activates_once(postgres_engine):
                 invitation_id=invitation.id,
                 mapping_id=mapping.id,
             )
-            purchase = BillingService(session).create_personal_purchase(user, plan.id)
+            purchase = BillingService(session).create_personal_purchase(
+                user, plan.id, uuid4().hex
+            )
             ids.update(
                 purchase_id=purchase.id,
                 payment_id=purchase.payment.id,

@@ -1,4 +1,6 @@
 from app.models.client import Client
+from app.models.billing_idempotency_record import BillingIdempotencyRecord
+from app.models.checkout_attempt import CheckoutAttempt, CheckoutAttemptHistory
 from app.models.entitlement_override import EntitlementOverride
 from app.models.feature import Feature
 from app.models.guest import Guest
@@ -24,6 +26,9 @@ from app.models.workspace import Workspace, WorkspaceMember
 
 __all__ = [
     "Client",
+    "BillingIdempotencyRecord",
+    "CheckoutAttempt",
+    "CheckoutAttemptHistory",
     "EntitlementOverride",
     "Feature",
     "Guest",

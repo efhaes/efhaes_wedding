@@ -1,5 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -28,6 +29,15 @@ class PaymentRead(BaseModel):
     paid_at: datetime | None
     created_at: datetime
     updated_at: datetime
+
+
+class CheckoutResponse(BaseModel):
+    payment_id: UUID
+    attempt_id: UUID
+    provider_order_id: str
+    status: Literal["creating", "ready", "indeterminate", "failed", "resolved"]
+    token: str | None = None
+    redirect_url: str | None = None
 
 
 class PersonalPurchaseRead(BaseModel):

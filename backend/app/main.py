@@ -140,6 +140,9 @@ def custom_openapi() -> dict:
                 or is_invitation_management
                 or is_billing
             ):
+                if path == "/api/v1/payments/midtrans/webhook":
+                    operation["security"] = []
+                    continue
                 schemes = {"AccessTokenCookie": []}
                 if method in {"post", "put", "patch", "delete"}:
                     schemes["CSRFToken"] = []

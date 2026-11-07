@@ -11,6 +11,7 @@ from sqlalchemy import (
     String,
     Uuid,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -33,6 +34,24 @@ class Payment(UUIDPrimaryKey, TimestampMixin, Base):
         Index("ix_payments_personal_purchase_id", "personal_purchase_id"),
         Index("ix_payments_subscription_id", "subscription_id"),
         Index("ix_payments_status", "status"),
+        Index(
+            "uq_payments_provider_order_id",
+            "provider",
+            "provider_order_id",
+            unique=True,
+            postgresql_where=text(
+                "provider IS NOT NULL AND provider_order_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_payments_provider_transaction_id",
+            "provider",
+            "provider_transaction_id",
+            unique=True,
+            postgresql_where=text(
+                "provider IS NOT NULL AND provider_transaction_id IS NOT NULL"
+            ),
+        ),
     )
 
     personal_purchase_id: Mapped[UUID | None] = mapped_column(
@@ -44,6 +63,8 @@ class Payment(UUIDPrimaryKey, TimestampMixin, Base):
     )
     provider: Mapped[str | None] = mapped_column(String(80))
     provider_reference: Mapped[str | None] = mapped_column(String(255), index=True)
+    provider_order_id: Mapped[str | None] = mapped_column(String(255))
+    provider_transaction_id: Mapped[str | None] = mapped_column(String(255))
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", server_default="pending")

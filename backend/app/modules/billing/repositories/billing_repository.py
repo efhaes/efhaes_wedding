@@ -1,9 +1,11 @@
+from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.feature import Feature
+from app.models.checkout_attempt import CheckoutAttempt
 from app.models.payment import Payment
 from app.models.personal_purchase import PersonalPurchase
 from app.models.plan import Plan
@@ -78,12 +80,66 @@ class BillingRepository:
             .with_for_update(of=Subscription)
         )
 
+    def subscription_workspace_id(self, subscription_id: UUID) -> UUID | None:
+        return self.session.scalar(
+            select(Subscription.workspace_id).where(
+                Subscription.id == subscription_id
+            )
+        )
+
     def lock_payment(self, payment_id: UUID) -> Payment | None:
         return self.session.scalar(
             select(Payment)
             .where(Payment.id == payment_id)
             .with_for_update(of=Payment)
         )
+
+    def checkout_attempt_for_payment(
+        self, payment_id: UUID, *, lock: bool = False
+    ) -> CheckoutAttempt | None:
+        statement = select(CheckoutAttempt).where(
+            CheckoutAttempt.payment_id == payment_id
+        )
+        if lock:
+            statement = statement.with_for_update(of=CheckoutAttempt)
+        return self.session.scalar(statement)
+
+    def lock_checkout_attempt(self, attempt_id: UUID) -> CheckoutAttempt | None:
+        return self.session.scalar(
+            select(CheckoutAttempt)
+            .where(CheckoutAttempt.id == attempt_id)
+            .with_for_update(of=CheckoutAttempt)
+        )
+
+    def due_checkout_attempt_ids(
+        self, now: datetime, *, limit: int
+    ) -> list[UUID]:
+        statement = (
+            select(CheckoutAttempt.id)
+            .where(
+                (
+                    (CheckoutAttempt.status.in_(("ready", "indeterminate")))
+                    & (
+                        CheckoutAttempt.lease_until.is_(None)
+                        | (CheckoutAttempt.lease_until <= now)
+                    )
+                    & (
+                        CheckoutAttempt.next_reconcile_at.is_(None)
+                        | (CheckoutAttempt.next_reconcile_at <= now)
+                    )
+                )
+                | (
+                    (CheckoutAttempt.status == "creating")
+                    & (
+                        CheckoutAttempt.lease_until.is_(None)
+                        | (CheckoutAttempt.lease_until <= now)
+                    )
+                )
+            )
+            .order_by(CheckoutAttempt.next_reconcile_at, CheckoutAttempt.created_at)
+            .limit(limit)
+        )
+        return list(self.session.scalars(statement))
 
     def active_or_pending_subscriptions(
         self, workspace_id: UUID
@@ -127,6 +183,17 @@ class BillingRepository:
 
     def get_payment(self, payment_id: UUID) -> Payment | None:
         return self.session.get(Payment, payment_id)
+
+    def payment_for_provider_order_id(
+        self, provider: str, provider_order_id: str, *, lock: bool = False
+    ) -> Payment | None:
+        statement = select(Payment).where(
+            Payment.provider == provider,
+            Payment.provider_order_id == provider_order_id,
+        )
+        if lock:
+            statement = statement.with_for_update(of=Payment)
+        return self.session.scalar(statement)
 
     def payment_for_purchase(self, purchase_id: UUID) -> Payment | None:
         return self.session.scalar(

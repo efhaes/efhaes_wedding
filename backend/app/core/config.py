@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     DATABASE_URL: str
     JWT_SECRET_KEY: SecretStr
+    MIDTRANS_SERVER_KEY: SecretStr | None = None
+    MIDTRANS_CLIENT_KEY: str | None = None
+    MIDTRANS_IS_PRODUCTION: bool = False
+    MIDTRANS_CURRENCY: str = "IDR"
+    MIDTRANS_TOKEN_ENCRYPTION_KEY: SecretStr | None = None
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
@@ -107,6 +112,51 @@ class Settings(BaseSettings):
         if self.COOKIE_SECURE is not None:
             return self.COOKIE_SECURE
         return self.APP_ENV.lower() not in {"development", "dev", "test"}
+
+    @property
+    def midtrans_api_base_url(self) -> str:
+        if self.MIDTRANS_IS_PRODUCTION:
+            return "https://api.midtrans.com"
+        return "https://api.sandbox.midtrans.com"
+
+    @property
+    def midtrans_snap_base_url(self) -> str:
+        if self.MIDTRANS_IS_PRODUCTION:
+            return "https://app.midtrans.com"
+        return "https://app.sandbox.midtrans.com"
+
+    def require_midtrans_server_key(self) -> SecretStr:
+        if (
+            self.MIDTRANS_SERVER_KEY is None
+            or not self.MIDTRANS_SERVER_KEY.get_secret_value().strip()
+        ):
+            raise RuntimeError("MIDTRANS_SERVER_KEY must be configured to use Midtrans")
+        return self.MIDTRANS_SERVER_KEY
+
+    def require_midtrans_token_encryption_key(self) -> SecretStr:
+        key = self.MIDTRANS_TOKEN_ENCRYPTION_KEY
+        if key is None or len(key.get_secret_value()) < 32:
+            raise RuntimeError(
+                "MIDTRANS_TOKEN_ENCRYPTION_KEY must be configured for checkout"
+            )
+        return key
+
+    def require_midtrans_currency(self) -> str:
+        currency = self.MIDTRANS_CURRENCY.strip().upper()
+        if (
+            len(currency) != 3
+            or not currency.isascii()
+            or not currency.isalpha()
+        ):
+            raise RuntimeError(
+                "MIDTRANS_CURRENCY must be a three-letter currency code"
+            )
+        return currency
+
+    def require_midtrans_client_key(self) -> str:
+        if self.MIDTRANS_CLIENT_KEY is None or not self.MIDTRANS_CLIENT_KEY.strip():
+            raise RuntimeError("MIDTRANS_CLIENT_KEY must be configured for frontend use")
+        return self.MIDTRANS_CLIENT_KEY
 
 
 settings = Settings()

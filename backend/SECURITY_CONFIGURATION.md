@@ -77,3 +77,22 @@ invalidates the previous token.
 whether an email address is new or already registered. Clients should display
 the generic response and continue through the normal sign-in flow instead of
 using registration to determine account existence.
+
+## Midtrans checkout
+
+Midtrans remains disabled until its credentials are configured. Sandbox is the
+default; `MIDTRANS_IS_PRODUCTION=true` selects the Production hosts. Configure
+`MIDTRANS_SERVER_KEY` only as a server-side secret. The current redirect-based
+checkout does not expose or require `MIDTRANS_CLIENT_KEY`.
+
+Configure `MIDTRANS_TOKEN_ENCRYPTION_KEY` as a separate random secret of at
+least 32 characters. It is used to encrypt Snap token/redirect response data
+before database storage and is not required for application startup. Rotating
+this key requires re-encrypting retained checkout responses before removing
+the old key; otherwise those responses cannot be replayed. The integration
+currently accepts only the configured merchant currency `IDR`.
+
+Never include Midtrans keys, webhook signatures, Snap tokens, or provider
+response bodies in logs. The webhook endpoint is intentionally unauthenticated
+for provider delivery and validates the Midtrans SHA-512 signature before
+processing; do not protect it with browser CSRF or user-cookie authentication.

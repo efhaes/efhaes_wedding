@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.payment import Payment
+from app.models.billing_idempotency_record import BillingIdempotencyRecord
 from app.models.personal_purchase import PersonalPurchase
 from app.models.subscription import Subscription
 from app.models.workspace import WorkspaceMember
@@ -15,6 +16,13 @@ from app.modules.billing.schemas.transactions import (
     PaymentRead,
     PersonalPurchaseRead,
     WorkspaceSubscriptionRead,
+)
+from app.modules.billing.services.idempotency import (
+    claim_idempotency_record,
+    complete_idempotency_record,
+    hash_idempotency_key,
+    mark_idempotency_replayed,
+    request_fingerprint,
 )
 from app.modules.users.models.user import User
 
@@ -25,8 +33,22 @@ class BillingService:
         self.repository = BillingRepository(session)
 
     def create_personal_purchase(
-        self, user: User, plan_id: UUID
+        self, user: User, plan_id: UUID, idempotency_key: str
     ) -> PersonalPurchaseRead:
+        key_hash = hash_idempotency_key(idempotency_key)
+        fingerprint = request_fingerprint(
+            "personal_purchase", {"plan_id": str(plan_id)}
+        )
+        idempotency_record, claimed = claim_idempotency_record(
+            self.session,
+            user_id=user.id,
+            operation="personal_purchase",
+            key_hash=key_hash,
+            fingerprint=fingerprint,
+        )
+        if not claimed:
+            return self._replay_personal_purchase(idempotency_record)
+
         plan = self.repository.lock_plan(plan_id)
         if plan is None:
             raise HTTPException(
@@ -67,6 +89,12 @@ class BillingService:
             status="pending",
         )
         self.repository.add(payment)
+        self._flush()
+        complete_idempotency_record(
+            idempotency_record,
+            personal_purchase_id=purchase.id,
+            payment_id=payment.id,
+        )
         self._commit()
         return self._purchase_read(purchase, payment)
 
@@ -88,7 +116,23 @@ class BillingService:
         user: User,
         workspace_id: UUID,
         plan_id: UUID,
+        idempotency_key: str,
     ) -> WorkspaceSubscriptionRead:
+        key_hash = hash_idempotency_key(idempotency_key)
+        fingerprint = request_fingerprint(
+            "workspace_subscription",
+            {"plan_id": str(plan_id), "workspace_id": str(workspace_id)},
+        )
+        idempotency_record, claimed = claim_idempotency_record(
+            self.session,
+            user_id=user.id,
+            operation="workspace_subscription",
+            key_hash=key_hash,
+            fingerprint=fingerprint,
+        )
+        if not claimed:
+            return self._replay_workspace_subscription(idempotency_record, user)
+
         workspace = self.repository.lock_workspace(workspace_id)
         if workspace is None:
             raise HTTPException(
@@ -174,6 +218,12 @@ class BillingService:
             status="pending",
         )
         self.repository.add(payment)
+        self._flush()
+        complete_idempotency_record(
+            idempotency_record,
+            subscription_id=subscription.id,
+            payment_id=payment.id,
+        )
         self._commit()
         return self._subscription_read(subscription, payment)
 
@@ -229,6 +279,41 @@ class BillingService:
                 detail="Workspace subscription not found",
             )
         return membership
+
+    def _replay_personal_purchase(
+        self, record: BillingIdempotencyRecord
+    ) -> PersonalPurchaseRead:
+        if record.personal_purchase_id is None or record.payment_id is None:
+            raise RuntimeError("Completed purchase idempotency record is incomplete")
+        purchase = self.repository.get_personal_purchase(record.personal_purchase_id)
+        payment = self.repository.get_payment(record.payment_id)
+        if purchase is None or payment is None:
+            raise RuntimeError("Completed purchase idempotency result is missing")
+        if payment.personal_purchase_id != purchase.id:
+            raise RuntimeError("Purchase idempotency result has inconsistent payment")
+        mark_idempotency_replayed(record)
+        self._commit()
+        return self._purchase_read(purchase, payment)
+
+    def _replay_workspace_subscription(
+        self, record: BillingIdempotencyRecord, user: User
+    ) -> WorkspaceSubscriptionRead:
+        if record.subscription_id is None or record.payment_id is None:
+            raise RuntimeError(
+                "Completed subscription idempotency record is incomplete"
+            )
+        subscription = self.repository.get_subscription(record.subscription_id)
+        payment = self.repository.get_payment(record.payment_id)
+        if subscription is None or payment is None:
+            raise RuntimeError("Completed subscription idempotency result is missing")
+        if payment.subscription_id != subscription.id:
+            raise RuntimeError(
+                "Subscription idempotency result has inconsistent payment"
+            )
+        self._require_workspace_billing_role(subscription.workspace_id, user.id)
+        mark_idempotency_replayed(record)
+        self._commit()
+        return self._subscription_read(subscription, payment)
 
     def _commit(self) -> None:
         try:
